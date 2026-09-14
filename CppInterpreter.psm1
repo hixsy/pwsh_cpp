@@ -271,10 +271,63 @@ function Convert-CppExpression {
 
     $expr = $expr -replace '(?<![=!])!(?!=)', ' -not '
 
+    #
+    # Replace known C++ variables with literal PowerShell values.
+    # This avoids relying on Invoke-Expression to resolve module-scope
+    # variables such as $script:CppVars['x'].
+    #
     foreach ($name in ($script:CppVars.Keys | Sort-Object Length -Descending)) {
         $escaped = [regex]::Escape($name)
-        $replacement = "`$script:CppVars['$name']"
-        $expr = $expr -replace "\b$escaped\b", $replacement
+        $value = $script:CppVars[$name]
+
+        if ($value -is [bool]) {
+            if ($value) {
+                $literal = '$true'
+            }
+            else {
+                $literal = '$false'
+            }
+        }
+        elseif ($value -is [char]) {
+            $literal = [string][int][char]$value
+        }
+        elseif ($value -is [string]) {
+            $escapedString = ([string]$value).Replace("'", "''")
+            $literal = "'" + $escapedString + "'"
+        }
+        elseif (
+            $value -is [byte] -or
+            $value -is [sbyte] -or
+            $value -is [int16] -or
+            $value -is [uint16] -or
+            $value -is [int32] -or
+            $value -is [uint32] -or
+            $value -is [int64] -or
+            $value -is [uint64] -or
+            $value -is [single] -or
+            $value -is [double] -or
+            $value -is [decimal]
+        ) {
+            $literal = [Convert]::ToString(
+                $value,
+                [System.Globalization.CultureInfo]::InvariantCulture
+            )
+        }
+        else {
+            $escapedString = ([string]$value).Replace("'", "''")
+            $literal = "'" + $escapedString + "'"
+        }
+
+        $pattern = "\b$escaped\b"
+
+        $expr = [regex]::Replace(
+            $expr,
+            $pattern,
+            [System.Text.RegularExpressions.MatchEvaluator]{
+                param($m)
+                return $literal
+            }
+        )
     }
 
     return $expr
@@ -296,375 +349,307 @@ function Invoke-CppExpression {
     }
 }
 
-function Invoke-CppStatement {
-param(
-[Parameter(Mandatory)]
-[string]$Statement
-)
-
-```
-$line = $Statement.Trim()
-
-if (-not $line) {
-    return
-}
-
-if ($line -match '^#') {
-    return
-}
-
-if ($line -match '^(int\s+)?main\s*\(') {
-    return
-}
-
-if ($line -match '^return\b') {
-    return
-}
-
-#
-# const char* name = "value";
-#
-if (
-    $line -match '^const\s+char\s*\*\s*([A-Za-z_]\w*)\s*=\s*"(.*)";$'
-) {
-    $script:CppVars[$matches[1]] =
-        Convert-CppStringLiteral $matches[2]
-
-    return
-}
-
-#
-# char* name = "value";
-#
-if (
-    $line -match '^char\s*\*\s*([A-Za-z_]\w*)\s*=\s*"(.*)";$'
-) {
-    $script:CppVars[$matches[1]] =
-        Convert-CppStringLiteral $matches[2]
-
-    return
-}
-
-#
-# char name[] = "value";
-#
-if (
-    $line -match '^char\s+([A-Za-z_]\w*)\s*\[\s*\]\s*=\s*"(.*)";$'
-) {
-    $script:CppVars[$matches[1]] =
-        Convert-CppStringLiteral $matches[2]
-
-    return
-}
-
-#
-# char name = 'A';
-#
-if (
-    $line -match '^char\s+([A-Za-z_]\w*)\s*=\s*''([^''\\]|\\.)'';$'
-) {
-    $name = $matches[1]
-    $charText = $matches[2]
-
-    if ($charText.StartsWith('\')) {
-        switch ($charText) {
-            '\n' {
-                $value = [char]"`n"
-            }
-
-            '\r' {
-                $value = [char]"`r"
-            }
-
-            '\t' {
-                $value = [char]"`t"
-            }
-
-            '\0' {
-                $value = [char]0
-            }
-
-            "\\'" {
-                $value = [char]"'"
-            }
-
-            '\\' {
-                $value = [char]'\'
-            }
-
-            default {
-                throw "Unsupported C++ character escape: $charText"
-            }
-        }
-    }
-    else {
-        $value = [char]$charText
-    }
-
-    $script:CppVars[$name] = $value
-
-    return
-}
-
-#
-# Numeric / bool / size_t declarations
-#
-if (
-    $line -match '^(int|float|double|bool|size_t)\s+([A-Za-z_]\w*)\s*(?:=\s*(.+))?;$'
-) {
-    $type = $matches[1]
-    $name = $matches[2]
-    $expression = $matches[3]
-
-    if ($expression) {
-        $value = Invoke-CppExpression $expression
-    }
-    else {
-        switch ($type) {
-            'int' {
-                $value = 0
-            }
-
-            'float' {
-                $value = 0.0
-            }
-
-            'double' {
-                $value = 0.0
-            }
-
-            'bool' {
-                $value = $false
-            }
-
-            'size_t' {
-                $value = [uint64]0
-            }
-        }
-    }
-
-    switch ($type) {
-        'int' {
-            $value = [int]$value
-        }
-
-        'float' {
-            $value = [single]$value
-        }
-
-        'double' {
-            $value = [double]$value
-        }
-
-        'bool' {
-            $value = [bool]$value
-        }
-
-        'size_t' {
-            $value = [uint64]$value
-        }
-    }
-
-    $script:CppVars[$name] = $value
-
-    return
-}
-
-#
-# Trace:
-#
-# hr = object->function(arg1, arg2, ...);
-#
-if (
-    $line -match '^hr\s*=\s*([A-Za-z_]\w*)\s*->\s*([A-Za-z_]\w*)\s*\((.*)\)\s*;$'
-) {
-    $objectName = $matches[1]
-    $functionName = $matches[2]
-    $arguments = $matches[3]
-
-    $args = @(Split-CppArguments $arguments)
-
-    $formattedArgs = @()
-
-    foreach ($arg in $args) {
-        $formattedArgs += Format-CppTraceValue $arg
-    }
-
-    $argText = $formattedArgs -join ', '
-
-    [Console]::WriteLine(
-        "hr = $objectName->$functionName($argText);"
+function Format-CppTraceValue {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Expression
     )
 
-    return
-}
+    $expr = $Expression.Trim()
 
-#
-# variable++;
-#
-if (
-    $line -match '^([A-Za-z_]\w*)\+\+;$'
-) {
-    $name = $matches[1]
+    if ($script:CppVars.ContainsKey($expr)) {
+        $value = $script:CppVars[$expr]
 
-    if (-not $script:CppVars.ContainsKey($name)) {
-        throw "Undefined variable: $name"
-    }
+        if ($value -is [bool]) {
+            if ($value) {
+                return 'true'
+            }
 
-    $script:CppVars[$name]++
-
-    return
-}
-
-#
-# variable--;
-#
-if (
-    $line -match '^([A-Za-z_]\w*)--;$'
-) {
-    $name = $matches[1]
-
-    if (-not $script:CppVars.ContainsKey($name)) {
-        throw "Undefined variable: $name"
-    }
-
-    $script:CppVars[$name]--
-
-    return
-}
-
-#
-# variable += expression;
-#
-if (
-    $line -match '^([A-Za-z_]\w*)\s*\+=\s*(.+);$'
-) {
-    $name = $matches[1]
-
-    if (-not $script:CppVars.ContainsKey($name)) {
-        throw "Undefined variable: $name"
-    }
-
-    $script:CppVars[$name] +=
-        Invoke-CppExpression $matches[2]
-
-    return
-}
-
-#
-# variable -= expression;
-#
-if (
-    $line -match '^([A-Za-z_]\w*)\s*-=\s*(.+);$'
-) {
-    $name = $matches[1]
-
-    if (-not $script:CppVars.ContainsKey($name)) {
-        throw "Undefined variable: $name"
-    }
-
-    $script:CppVars[$name] -=
-        Invoke-CppExpression $matches[2]
-
-    return
-}
-
-#
-# variable *= expression;
-#
-if (
-    $line -match '^([A-Za-z_]\w*)\s*\*=\s*(.+);$'
-) {
-    $name = $matches[1]
-
-    if (-not $script:CppVars.ContainsKey($name)) {
-        throw "Undefined variable: $name"
-    }
-
-    $script:CppVars[$name] *=
-        Invoke-CppExpression $matches[2]
-
-    return
-}
-
-#
-# variable /= expression;
-#
-if (
-    $line -match '^([A-Za-z_]\w*)\s*/=\s*(.+);$'
-) {
-    $name = $matches[1]
-
-    if (-not $script:CppVars.ContainsKey($name)) {
-        throw "Undefined variable: $name"
-    }
-
-    $script:CppVars[$name] /=
-        Invoke-CppExpression $matches[2]
-
-    return
-}
-
-#
-# variable = expression;
-#
-if (
-    $line -match '^([A-Za-z_]\w*)\s*=\s*(.+);$'
-) {
-    $name = $matches[1]
-
-    if (-not $script:CppVars.ContainsKey($name)) {
-        throw "Undefined variable: $name"
-    }
-
-    $script:CppVars[$name] =
-        Invoke-CppExpression $matches[2]
-
-    return
-}
-
-#
-# std::cout
-#
-if (
-    $line -match '^std::cout\s*<<\s*(.+);$'
-) {
-    $output = $matches[1]
-
-    $parts = $output -split '\s*<<\s*'
-
-    foreach ($part in $parts) {
-        $part = $part.Trim()
-
-        if ($part -eq 'std::endl') {
-            [Console]::WriteLine()
-            continue
+            return 'false'
         }
 
-        if ($part -match '^"(.*)"$') {
-            $value =
-                Convert-CppStringLiteral $matches[1]
+        if ($value -is [char]) {
+            return "'" + [string]$value + "'"
+        }
 
-            [Console]::Write($value)
+        if ($value -is [string]) {
+            $escaped = ([string]$value).Replace('\', '\\').Replace('"', '\"')
+            return '"' + $escaped + '"'
+        }
+
+        return [Convert]::ToString(
+            $value,
+            [System.Globalization.CultureInfo]::InvariantCulture
+        )
+    }
+
+    if ($expr -match '^".*"$') {
+        return $expr
+    }
+
+    if ($expr -match "^'.*'$") {
+        return $expr
+    }
+
+    try {
+        $value = Invoke-CppExpression $expr
+
+        if ($value -is [bool]) {
+            if ($value) {
+                return 'true'
+            }
+
+            return 'false'
+        }
+
+        if ($value -is [char]) {
+            return "'" + [string]$value + "'"
+        }
+
+        if ($value -is [string]) {
+            $escaped = ([string]$value).Replace('\', '\\').Replace('"', '\"')
+            return '"' + $escaped + '"'
+        }
+
+        return [Convert]::ToString(
+            $value,
+            [System.Globalization.CultureInfo]::InvariantCulture
+        )
+    }
+    catch {
+        return $expr
+    }
+}
+
+function Invoke-CppStatement {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Statement
+    )
+
+    $line = $Statement.Trim()
+
+    if (-not $line) {
+        return
+    }
+
+    if ($line -match '^#') {
+        return
+    }
+
+    if ($line -match '^(int\s+)?main\s*\(') {
+        return
+    }
+
+    if ($line -match '^return\b') {
+        return
+    }
+
+    # const char* name = "value";
+    if ($line -match '^const\s+char\s*\*\s*([A-Za-z_]\w*)\s*=\s*"(.*)";$') {
+        $script:CppVars[$matches[1]] = Convert-CppStringLiteral $matches[2]
+        return
+    }
+
+    # char* name = "value";
+    if ($line -match '^char\s*\*\s*([A-Za-z_]\w*)\s*=\s*"(.*)";$') {
+        $script:CppVars[$matches[1]] = Convert-CppStringLiteral $matches[2]
+        return
+    }
+
+    # char name[] = "value";
+    if ($line -match '^char\s+([A-Za-z_]\w*)\s*\[\s*\]\s*=\s*"(.*)";$') {
+        $script:CppVars[$matches[1]] = Convert-CppStringLiteral $matches[2]
+        return
+    }
+
+    # Character scalar.
+    if ($line -match '^char\s+([A-Za-z_]\w*)\s*=\s*''([^''\\]|\\.)'';$') {
+        $name = $matches[1]
+        $charText = $matches[2]
+
+        if ($charText.StartsWith('\')) {
+            switch ($charText) {
+                '\n' { $value = [char]"`n" }
+                '\r' { $value = [char]"`r" }
+                '\t' { $value = [char]"`t" }
+                '\0' { $value = [char]0 }
+                "\\'" { $value = [char]"'" }
+                '\\' { $value = [char]'\' }
+                default { throw "Unsupported C++ character escape: $charText" }
+            }
         }
         else {
-            $value =
-                Invoke-CppExpression $part
-
-            [Console]::Write(
-                [string]$value
-            )
+            $value = [char]$charText
         }
+
+        $script:CppVars[$name] = $value
+        return
     }
 
-    return
+    # Numeric / bool / size_t declarations.
+    if ($line -match '^(int|float|double|bool|size_t)\s+([A-Za-z_]\w*)\s*(?:=\s*(.+))?;$') {
+        $type = $matches[1]
+        $name = $matches[2]
+        $expression = $matches[3]
+
+        if ($expression) {
+            $value = Invoke-CppExpression $expression
+        }
+        else {
+            switch ($type) {
+                'int'    { $value = 0 }
+                'float'  { $value = 0.0 }
+                'double' { $value = 0.0 }
+                'bool'   { $value = $false }
+                'size_t' { $value = [uint64]0 }
+            }
+        }
+
+        switch ($type) {
+            'int'    { $value = [int]$value }
+            'float'  { $value = [single]$value }
+            'double' { $value = [double]$value }
+            'bool'   { $value = [bool]$value }
+            'size_t' { $value = [uint64]$value }
+        }
+
+        $script:CppVars[$name] = $value
+        return
+    }
+
+    #
+    # Trace HRESULT-style member calls without executing the member function:
+    #
+    # hr = object->function(arg1, arg2, ...);
+    #
+    if (
+        $line -match '^hr\s*=\s*([A-Za-z_]\w*)\s*->\s*([A-Za-z_]\w*)\s*\((.*)\)\s*;$'
+    ) {
+        $objectName = $matches[1]
+        $functionName = $matches[2]
+        $arguments = $matches[3]
+
+        $args = @(Split-CppArguments $arguments)
+        $formattedArgs = @()
+
+        foreach ($arg in $args) {
+            $formattedArgs += Format-CppTraceValue $arg
+        }
+
+        $argText = $formattedArgs -join ', '
+
+        [Console]::WriteLine(
+            "hr = $objectName->$functionName($argText);"
+        )
+
+        return
+    }
+
+    if ($line -match '^([A-Za-z_]\w*)\+\+;$') {
+        $name = $matches[1]
+
+        if (-not $script:CppVars.ContainsKey($name)) {
+            throw "Undefined variable: $name"
+        }
+
+        $script:CppVars[$name]++
+        return
+    }
+
+    if ($line -match '^([A-Za-z_]\w*)--;$') {
+        $name = $matches[1]
+
+        if (-not $script:CppVars.ContainsKey($name)) {
+            throw "Undefined variable: $name"
+        }
+
+        $script:CppVars[$name]--
+        return
+    }
+
+    if ($line -match '^([A-Za-z_]\w*)\s*\+=\s*(.+);$') {
+        $name = $matches[1]
+
+        if (-not $script:CppVars.ContainsKey($name)) {
+            throw "Undefined variable: $name"
+        }
+
+        $script:CppVars[$name] += Invoke-CppExpression $matches[2]
+        return
+    }
+
+    if ($line -match '^([A-Za-z_]\w*)\s*-=\s*(.+);$') {
+        $name = $matches[1]
+
+        if (-not $script:CppVars.ContainsKey($name)) {
+            throw "Undefined variable: $name"
+        }
+
+        $script:CppVars[$name] -= Invoke-CppExpression $matches[2]
+        return
+    }
+
+    if ($line -match '^([A-Za-z_]\w*)\s*\*=\s*(.+);$') {
+        $name = $matches[1]
+
+        if (-not $script:CppVars.ContainsKey($name)) {
+            throw "Undefined variable: $name"
+        }
+
+        $script:CppVars[$name] *= Invoke-CppExpression $matches[2]
+        return
+    }
+
+    if ($line -match '^([A-Za-z_]\w*)\s*/=\s*(.+);$') {
+        $name = $matches[1]
+
+        if (-not $script:CppVars.ContainsKey($name)) {
+            throw "Undefined variable: $name"
+        }
+
+        $script:CppVars[$name] /= Invoke-CppExpression $matches[2]
+        return
+    }
+
+    if ($line -match '^([A-Za-z_]\w*)\s*=\s*(.+);$') {
+        $name = $matches[1]
+
+        if (-not $script:CppVars.ContainsKey($name)) {
+            throw "Undefined variable: $name"
+        }
+
+        $script:CppVars[$name] = Invoke-CppExpression $matches[2]
+        return
+    }
+
+    if ($line -match '^std::cout\s*<<\s*(.+);$') {
+        $output = $matches[1]
+        $parts = $output -split '\s*<<\s*'
+
+        foreach ($part in $parts) {
+            $part = $part.Trim()
+
+            if ($part -eq 'std::endl') {
+                [Console]::WriteLine()
+                continue
+            }
+
+            if ($part -match '^"(.*)"$') {
+                $value = Convert-CppStringLiteral $matches[1]
+                [Console]::Write($value)
+            }
+            else {
+                $value = Invoke-CppExpression $part
+                [Console]::Write([string]$value)
+            }
+        }
+
+        return
+    }
+
+    throw "Unsupported C++ statement: $line"
 }
-
-throw "Unsupported C++ statement: $line"
-```
-
-}
-
 
 function Invoke-CppSwitch {
     param(
@@ -1075,66 +1060,5 @@ function Invoke-CppFile {
 
     Invoke-Cpp -Path $Path
 }
-# this checks for driver calls
-function Format-CppTraceValue {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Expression
-    )
 
-    $expr = $Expression.Trim()
-
-    # Direct variable
-    if ($script:CppVars.ContainsKey($expr)) {
-        $value = $script:CppVars[$expr]
-
-        if ($value -is [bool]) {
-            if ($value) {
-                return 'true'
-            }
-
-            return 'false'
-        }
-
-        if ($value -is [char]) {
-            return "'$value'"
-        }
-
-        if ($value -is [string]) {
-            $escaped = $value.Replace('\', '\\').Replace('"', '\"')
-            return "`"$escaped`""
-        }
-
-        return [string]$value
-    }
-
-    # Literal string
-    if ($expr -match '^".*"$') {
-        return $expr
-    }
-
-    # Literal character
-    if ($expr -match "^'.*'$") {
-        return $expr
-    }
-
-    # Try evaluating arithmetic / boolean expressions.
-    try {
-        $value = Invoke-CppExpression $expr
-
-        if ($value -is [bool]) {
-            if ($value) {
-                return 'true'
-            }
-
-            return 'false'
-        }
-
-        return [string]$value
-    }
-    catch {
-        # If we cannot evaluate it, print it unchanged.
-        return $expr
-    }
-}
 Export-ModuleMember -Function Invoke-Cpp, Invoke-CppFile
